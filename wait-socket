@@ -1,0 +1,160 @@
+#!/bin/sh
+set -eu
+
+opt_tcp=0
+opt_udp=0
+opt_unix=0
+opt_verbose=0
+opt_timeout=2000
+opt_pause=50
+opt_inet4=0
+opt_inet6=0
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS] [--] path | address port
+
+Waits for a server's socket, on the local host, to enter a listening state.
+This program can be used in readiness tests after starting a server program.
+
+Positional arguments:
+
+  path           For Unix domain sockets: the path to the filesystem
+
+  address        For TCP/IP sockets: the binding IP address or host name
+  port           For TCP/IP sockets: the port number or service name
+
+Options:
+
+  -x, --unix     Wait for a listening Unix domain socket
+  -t, --tcp      Wait for a listening TCP socket [Default]
+  -u, --udp      Wait for a listening UDP socket
+
+  -4, --inet4    Restrict to IPv4 only
+  -6, --inet6    Restrict to IPv6 only
+
+  -v, --verbose  Show progrss messages
+
+  --timeout MS   Stop all waiting after MS milliseconds [Default: 2000]
+  --pause MS     Wait MS milliseconds between polls [Default: 50]
+
+  --help         Display this help text
+  --version      Display version of this software
+
+EOF
+    exit 0
+}
+
+# Call GNU getopt to canonicalize arguments.
+# -o defines short options ('h' takes no arg, 'n:' takes a required arg)
+# -l defines long options ('help' takes no arg, 'name:' takes a required arg)
+short_options="tuxv46"
+long_options="help,version,tcp,udp,unix,verbose,inet4,inet6,timeout:,pause:"
+parsed=$(getopt -o "$short_options" --long "$long_options" -n "$0" -- "$@")
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+# Re-assign positional parameters using eval to safely retain quotes/spaces
+eval set -- "$parsed"
+
+# Parse options until reaching the '--' separator
+while true; do
+    case "$1" in
+        --help)          usage;;
+        --version)       echo "Version 1.0.0"; exit 0;;
+        -t|--tcp)        opt_tcp=1; shift;;
+        -u|--udp)        opt_udp=1; shift;;
+        -x|--unix)       opt_unix=1; shift;;
+        -v|--verbose)    opt_verbose=1; shift;;
+        -4|--inet4)      opt_inet4=1; shift;;
+        -6|--inet6)      opt_inet6=1; shift;;
+        --timeout)       opt_timeout="$2"; shift 2;;
+        --pause)         opt_pause="$2"; shift 2;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo >&2 "$0: internal argument parsing error"
+            exit 1
+            ;;
+    esac
+done
+
+if [ $((opt_tcp + opt_udp + opt_unix)) -gt 1 ] ; then
+    echo >&2 "$0: at most one of the options --tcp, --udp, --unix may be specified"
+    exit 1
+fi
+
+if [ $((opt_inet4 + opt_inet6)) -gt 1 ] ; then
+    echo >&2 "$0: at most one of the options --inet4, --inet6 may be specified"
+    exit 1
+fi
+
+[ $((opt_tcp + opt_udp + opt_unix)) -eq 0 ] && opt_tcp=1
+
+if [ $opt_unix -ne 0 ] ; then
+    if [ -z "${1:-}" ] ; then
+        echo >&2 "$0: path to Unix domain socket must be specified"
+        exit 1
+    fi
+    ss_source="$1"
+else
+    if [ -z "${1:-}" ] || [ -z "${2:-}" ] ; then
+        echo >&2 "$0: address and port for TCP/IP socket must be specified"
+        exit 1
+    fi
+
+    # The following are only preliminary filters to prevent 
+    # syntactic errors to the "src" filter of the "ss" command
+    
+    if ! expr "_$2" : '_[-a-zA-Z0-9]\+$' >/dev/null; then
+        echo >&2 "$0: port or service for socket is incorrectly specified"
+        exit 1
+    fi
+
+    # Numerical IPv6 address: hexadecimal digits with at least one colon
+    if expr "_$1" : '_[0-9a-fA-F]*:[0-9a-fA-F:]\+$' >/dev/null; then
+        ss_source="[$1]:$2"
+    elif expr "_$1" : '_.*:' >/dev/null; then
+        echo >&2 "$0: address for socket is incorrectly specified"
+        exit 1
+    else
+        ss_source="$1:$2"
+    fi
+fi
+
+if [ $opt_tcp -ne 0 ] ; then ss_type_opt='-t'
+elif [ $opt_udp -ne 0 ] ; then ss_type_opt='-u'
+elif [ $opt_unix -ne 0 ] ; then ss_type_opt='-x' ; fi
+
+ss_family=
+if [ $opt_inet4 -ne 0 ] ; then ss_family='inet:'
+elif [ $opt_inet6 -ne 0 ] ; then ss_family='inet6:' ; fi
+
+elapsed=0
+trials=0
+
+[ $opt_verbose -ne 0 ] && echo "$0: awaiting listening socket at $ss_source"
+
+while true
+do
+    # Use an explicit test to make sure this loop quits if "ss" returns an error
+    result="$(ss "$ss_type_opt" -lHO src "${ss_family}${ss_source}")" 
+    [ -n "$result" ] && break
+
+    if [ "$elapsed" -ge "$opt_timeout" ] ; then
+        [ $opt_verbose -ne 0 ] && echo >&2 "$0: timed out before socket became available"
+        exit 2
+    fi
+
+    trials=$((trials + 1))
+    [ $opt_verbose -ne 0 ] && echo >&2 "$0: still waiting after $elapsed milliseconds [trial #$trials]"
+    sleep "$(printf '%u.%03u' $((opt_pause / 1000)) $((opt_pause % 1000)))"
+    elapsed=$((elapsed + opt_pause))
+done
+
+[ $opt_verbose -ne 0 ] && echo "$0: socket is confirmed available"
+exit 0
+
