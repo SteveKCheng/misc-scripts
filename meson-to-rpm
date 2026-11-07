@@ -1,0 +1,121 @@
+#!/bin/sh
+set -eu
+
+prog_name="$0"
+
+usage()
+{
+    cat <<EOF
+Usage: $prog_name [OPTIONS] build-dir
+
+Creates a quick-and-dirty RPM package from software built using Meson.
+
+Requires the tool FPM (Effing Packing Management) from 
+https://github.com/jordansissel/fpm.
+
+Arguments:
+
+  build-dir               Existing Meson build directory
+
+Options:
+
+  -n, --pkg-name          Set name of RPM package
+  -v, --pkg-version       Set version of RPM package
+
+  If any the above options is not specified, the default value is retrieved
+  from the project properties of the Meson build.
+
+  -s, --staging-dir=DIR   Path to staging directory.  Defaults to a 
+                          uniquely-created subdirectory of \$TMPDIR, or
+                          /tmp if that is not defined.
+  -k, --keep-staging      Keep any created staging directory after this 
+                          program finishes.
+  -d, --dry-run           Show only the commands being run
+
+EOF
+}
+
+error()
+{
+    echo >&2 "$prog_name: $2"
+    exit $1
+}
+
+short_options="v:,n:,s:,k,d"
+long_options="help,pkg-version:,pkg-name:,staging-dir:,keep-staging"
+parsed=$(getopt -o "$short_options" --long "$long_options" -n "$0" -- "$@")
+if [ $? -ne 0 ]; then
+    usage
+    exit 1
+fi
+
+eval set -- "$parsed"
+
+pkg_version=
+pkg_name=
+staging_dir=
+keep_staging=0
+dry_run=0
+
+# Parse options until reaching the '--' separator
+while true; do
+    case "$1" in
+        -v|--pkg-version)  pkg_version="$2"; shift 2;;
+        -n|--pkg-name)     pkg_name="$2"; shift 2;;
+        -s|--staging-dir)  staging_dir="$2"; shift 2;;
+        -k|--keep-staging) keep_staging=1; shift;;
+        -d|--dry-run)      dry_run=1; shift;;
+        --help)            usage; exit 0;;
+        --)                shift; break;;
+        *)
+            error 1 "internal argument parsing error"
+            exit 1
+            ;;
+    esac
+done
+
+which fpm >& /dev/null || error 3 "fpm tool cannot be found"
+which meson >& /dev/null || error 3 "meson tool cannot be bound"
+
+build_dir="${1:-}"
+
+[ -n "$build_dir" ] || error 1 "build-dir must be specified"
+[ $# -eq 1 ] || error 1 "too many arguments"
+
+if [ -z "$pkg_version" ] ; then
+    pkg_version="$(meson introspect --projectinfo -- "$build_dir" | jq -r .version)"
+    [ -n "$pkg_version" ] || error 2 "could not determine package version automatically"
+fi
+
+if [ -z "$pkg_name" ] ; then
+    pkg_name="$(meson introspect --projectinfo -- "$build_dir" | jq -r .descriptive_name)"
+    [ -n "$pkg_name" ] || error 2 "could not determine package name automatically"
+fi
+
+created_staging_dir=1
+if [ -n "$staging_dir" ] ; then
+    ! [ -e "$staging_dir" ] || created_staging_dir=0
+    mkdir -p "$staging_dir"
+else
+    staging_dir="$(mktemp -d -p "" "meson-rpm-build-XXXXXXX")"
+fi
+
+cleanup()
+{
+    rm -rf "$staging_dir"
+}
+
+if [ $created_staging_dir -ne 0 ] && [ $keep_staging -eq 0 ] ; then
+    trap cleanup EXIT TERM INT
+fi
+
+run()
+{
+    printf "%q " "$@"; echo 
+    [ $dry_run -ne 0 ] || "$@"
+} 
+
+export DESTDIR="$staging_dir"
+printf "%q " DESTDIR="$staging_dir"
+run meson install -C "$build_dir"
+run fpm -s dir -t rpm -n "$pkg_name" -v "$pkg_version" -C "$staging_dir" .
